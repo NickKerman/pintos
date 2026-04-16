@@ -5,6 +5,8 @@
 #include <list.h>
 #include <stdint.h>
 
+struct lock;
+
 /** States in a thread's life cycle. */
 enum thread_status
   {
@@ -87,11 +89,18 @@ struct thread
     enum thread_status status;          /**< Thread state. */
     char name[16];                      /**< Name (for debugging purposes). */
     uint8_t *stack;                     /**< Saved stack pointer. */
-    int priority;                       /**< Priority. */
+    int priority;                       /**< Effective priority (donations included). */
+    int base_priority;                  /**< Priority set by the user (no donation). */
+    uint64_t sched_ord;                 /**< FIFO order among threads with equal priority. */
     struct list_elem allelem;           /**< List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /**< List element. */
+
+    int64_t wakeup_tick;               /**< Global tick at which a sleeping thread wakes. */
+
+    struct lock *wait_lock;            /**< Lock this thread is waiting to acquire, or NULL. */
+    struct list locks_held;           /**< Locks currently held (struct lock helem). */
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
@@ -118,6 +127,11 @@ tid_t thread_create (const char *name, int priority, thread_func *, void *);
 
 void thread_block (void);
 void thread_unblock (struct thread *);
+
+bool thread_priority_less (const struct list_elem *, const struct list_elem *, void *);
+void thread_ready_ord_assign (struct thread *);
+void thread_yield_if_higher_priority_ready (void);
+void thread_donation_refresh (struct thread *);
 
 struct thread *thread_current (void);
 tid_t thread_tid (void);

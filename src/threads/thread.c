@@ -61,6 +61,8 @@ bool thread_mlfqs;
 
 static void kernel_thread (thread_func *, void *aux);
 
+static uint64_t next_sched_ord;
+
 static void idle (void *aux UNUSED);
 static struct thread *running_thread (void);
 static struct thread *next_thread_to_run (void);
@@ -70,6 +72,7 @@ static void *alloc_frame (struct thread *, size_t size);
 static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
+static int thread_compute_donation (struct thread *t, int depth);
 
 /** Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -200,6 +203,7 @@ thread_create (const char *name, int priority,
 
   /* Add to run queue. */
   thread_unblock (t);
+  thread_yield_if_higher_priority_ready ();
 
   return tid;
 }
@@ -237,7 +241,8 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  thread_ready_ord_assign (t);
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_less, NULL);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -308,7 +313,10 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    {
+      thread_ready_ord_assign (cur);
+      list_insert_ordered (&ready_list, &cur->elem, thread_priority_less, NULL);
+    }
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -335,7 +343,15 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
-  thread_current ()->priority = new_priority;
+  enum intr_level old_level;
+
+  ASSERT (PRI_MIN <= new_priority && new_priority <= PRI_MAX);
+
+  old_level = intr_disable ();
+  thread_current ()->base_priority = new_priority;
+  thread_donation_refresh (thread_current ());
+  intr_set_level (old_level);
+  thread_yield_if_higher_priority_ready ();
 }
 
 /** Returns the current thread's priority. */
@@ -461,6 +477,8 @@ init_thread (struct thread *t, const char *name, int priority)
   t->status = THREAD_BLOCKED;
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
+  list_init (&t->locks_held);
+  t->base_priority = priority;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
 
@@ -579,6 +597,104 @@ allocate_tid (void)
   return tid;
 }
 
+/** True if thread A should appear before B in a priority-ordered list
+    (higher priority first; FIFO among equal priorities). */
+bool
+thread_priority_less (const struct list_elem *a, const struct list_elem *b,
+                       void *aux UNUSED)
+{
+  const struct thread *ta = list_entry (a, struct thread, elem);
+  const struct thread *tb = list_entry (b, struct thread, elem);
+
+  if (ta->priority != tb->priority)
+    return ta->priority > tb->priority;
+  return ta->sched_ord < tb->sched_ord;
+}
+
+/** Assigns a new FIFO order value for the next time T is queued. */
+void
+thread_ready_ord_assign (struct thread *t)
+{
+  ASSERT (t != NULL);
+  t->sched_ord = ++next_sched_ord;
+}
+
+/** Yields the CPU if the highest-priority ready thread outranks the current one. */
+void
+thread_yield_if_higher_priority_ready (void)
+{
+  struct thread *cur;
+  struct thread *first;
+
+  if (intr_context ())
+    return;
+  if (list_empty (&ready_list))
+    return;
+
+  cur = thread_current ();
+  first = list_entry (list_front (&ready_list), struct thread, elem);
+  if (first->priority > cur->priority)
+    thread_yield ();
+}
+
+/** Effective priority from BASE and nested donations via locks T holds. */
+static int
+thread_compute_donation (struct thread *t, int depth)
+{
+  int max_pri = t->base_priority;
+  struct list_elem *e;
+
+  if (depth > 8)
+    return max_pri;
+
+  for (e = list_begin (&t->locks_held); e != list_end (&t->locks_held);
+       e = list_next (e))
+    {
+      struct lock *lk = list_entry (e, struct lock, helem);
+      struct list_elem *w;
+
+      for (w = list_begin (&lk->semaphore.waiters);
+           w != list_end (&lk->semaphore.waiters);
+           w = list_next (w))
+        {
+          struct thread *wt = list_entry (w, struct thread, elem);
+          int wp = thread_compute_donation (wt, depth + 1);
+          if (wp > max_pri)
+            max_pri = wp;
+        }
+    }
+  return max_pri;
+}
+
+/** Recomputes T's effective priority and propagates up the wait-lock chain. */
+void
+thread_donation_refresh (struct thread *t)
+{
+  struct thread *walk;
+  int hops;
+
+  for (walk = t, hops = 0; walk != NULL && hops < 8; hops++)
+    {
+      int new_pri = thread_compute_donation (walk, 0);
+      int old_pri = walk->priority;
+
+      if (new_pri == old_pri)
+        break;
+
+      walk->priority = new_pri;
+      if (walk->status == THREAD_READY)
+        {
+          list_remove (&walk->elem);
+          thread_ready_ord_assign (walk);
+          list_insert_ordered (&ready_list, &walk->elem, thread_priority_less, NULL);
+        }
+
+      if (walk->wait_lock == NULL || walk->wait_lock->holder == NULL)
+        break;
+      walk = walk->wait_lock->holder;
+    }
+}
+
 /** Offset of `stack' member within `struct thread'.
    Used by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
